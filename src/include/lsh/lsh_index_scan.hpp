@@ -1,0 +1,41 @@
+#pragma once
+
+#include "duckdb/common/helper.hpp"
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/function/function.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/function/table/table_scan.hpp"
+
+namespace duckdb {
+
+class Index;
+
+// This is created by the optimizer rule
+struct LSHIndexScanBindData final : public TableScanBindData {
+	explicit LSHIndexScanBindData(TableCatalogEntry &table, Index &index, idx_t limit,
+	                               unsafe_unique_array<float> query)
+	    : TableScanBindData(table), index(index), limit(limit), query(std::move(query)) {
+	}
+
+	//! The index to use
+	Index &index;
+
+	//! The limit of the scan
+	idx_t limit;
+
+	//! The query vector
+	unsafe_unique_array<float> query;
+
+public:
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<LSHIndexScanBindData>();
+		return &other.table == &table;
+	}
+};
+
+struct LSHIndexScanFunction {
+	static TableFunction GetFunction();
+};
+
+} // namespace duckdb
