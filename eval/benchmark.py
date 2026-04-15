@@ -2,8 +2,13 @@
 """
 Benchmark: Full Scan vs HNSW vs LSH in DuckDB
 Evaluates query latency, recall@K, index build time, and scalability.
+
+Usage:
+    python benchmark.py --dataset sift
+    python benchmark.py --dataset glove
 """
 
+import argparse
 import csv
 import os
 import struct
@@ -17,18 +22,33 @@ import numpy as np
 # Config
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(SCRIPT_DIR, "data")
-RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
-PLOTS_DIR = os.path.join(SCRIPT_DIR, "plots")
 EXTENSION_PATH = os.path.join(
     SCRIPT_DIR, "..", "build", "release", "extension", "vss", "vss.duckdb_extension"
 )
 
 K = 10
 NUM_QUERIES = 200
-DATASET_SIZES = [10_000, 50_000, 100_000, 500_000, 1_000_000]
 LSH_TABLES_GRID = [2, 4, 8, 16, 32]
 LSH_BITS_GRID = [8, 12, 16, 24, 32]
+
+DATASET_CONFIG = {
+    "sift": {
+        "data_dir": os.path.join(SCRIPT_DIR, "data", "sift"),
+        "base": "sift_base.fvecs",
+        "query": "sift_query.fvecs",
+        "groundtruth": "sift_groundtruth.ivecs",
+        "sizes": [10_000, 50_000, 100_000, 500_000, 1_000_000],
+        "label": "SIFT-128d",
+    },
+    "glove": {
+        "data_dir": os.path.join(SCRIPT_DIR, "data", "glove"),
+        "base": "glove_base.fvecs",
+        "query": "glove_query.fvecs",
+        "groundtruth": "glove_groundtruth.ivecs",
+        "sizes": [10_000, 50_000, 100_000, 500_000, 1_000_000],
+        "label": "GloVe-200d",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # fvecs / ivecs parsing
@@ -37,8 +57,7 @@ LSH_BITS_GRID = [8, 12, 16, 24, 32]
 def read_fvecs(path):
     with open(path, "rb") as f:
         data = f.read()
-    offset = 0
-    vectors = []
+    offset, vectors = 0, []
     while offset < len(data):
         (dim,) = struct.unpack_from("<i", data, offset)
         offset += 4
@@ -51,8 +70,7 @@ def read_fvecs(path):
 def read_ivecs(path):
     with open(path, "rb") as f:
         data = f.read()
-    offset = 0
-    vectors = []
+    offset, vectors = 0, []
     while offset < len(data):
         (dim,) = struct.unpack_from("<i", data, offset)
         offset += 4
@@ -60,7 +78,6 @@ def read_ivecs(path):
         offset += dim * 4
         vectors.append(vec)
     return np.array(vectors, dtype=np.int32)
-
 
 # ---------------------------------------------------------------------------
 # DuckDB helpers
@@ -72,31 +89,28 @@ def get_connection():
     return conn
 
 
-def load_table(conn, base_vectors, n):
-    """Create table and insert the first n base vectors."""
-    conn.execute("DROP TABLE IF EXISTS sift")
-    conn.execute("CREATE TABLE sift (id INTEGER, embedding FLOAT[128])")
+def load_table(conn, base_vectors, n, dim):
+    conn.execute("DROP TABLE IF EXISTS vectors")
+    conn.execute(f"CREATE TABLE vectors (id INTEGER, embedding FLOAT[{dim}])")
     batch = 10_000
     for start in range(0, n, batch):
         end = min(start + batch, n)
         rows = []
         for i in range(start, end):
             vec_str = "[" + ",".join(str(float(x)) for x in base_vectors[i]) + "]"
-            rows.append(f"({i}, {vec_str}::FLOAT[128])")
-        conn.execute(f"INSERT INTO sift VALUES {','.join(rows)}")
+            rows.append(f"({i}, {vec_str}::FLOAT[{dim}])")
+        conn.execute(f"INSERT INTO vectors VALUES {','.join(rows)}")
 
 
-def query_vec_sql(vec):
-    return "[" + ",".join(str(float(x)) for x in vec) + "]::FLOAT[128]"
+def query_vec_sql(vec, dim):
+    return "[" + ",".join(str(float(x)) for x in vec) + f"]::FLOAT[{dim}]"
 
 
-def run_queries(conn, queries, k):
-    """Run top-K queries, return (list of result id lists, list of latencies)."""
-    all_results = []
-    latencies = []
+def run_queries(conn, queries, k, dim):
+    all_results, latencies = [], []
     for q in queries:
-        q_sql = query_vec_sql(q)
-        sql = f"SELECT id FROM sift ORDER BY array_distance(embedding, {q_sql}) LIMIT {k}"
+        q_sql = query_vec_sql(q, dim)
+        sql = f"SELECT id FROM vectors ORDER BY array_distance(embedding, {q_sql}) LIMIT {k}"
         t0 = time.perf_counter()
         res = conn.execute(sql).fetchall()
         t1 = time.perf_counter()
@@ -104,29 +118,25 @@ def run_queries(conn, queries, k):
         latencies.append(t1 - t0)
     return all_results, latencies
 
-
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
 def compute_recall(results, ground_truth, k):
-    """Average recall@K across queries."""
     recalls = []
     for res, gt in zip(results, ground_truth):
-        gt_set = set(gt[:k])
+        gt_set = set(int(x) for x in gt[:k])
         res_set = set(res[:k])
         recalls.append(len(res_set & gt_set) / k)
     return np.mean(recalls)
-
 
 # ---------------------------------------------------------------------------
 # Benchmark runners
 # ---------------------------------------------------------------------------
 
-def bench_full_scan(conn, queries, k):
-    """Run full scan queries. Returns metrics dict AND the results (used as ground truth)."""
+def bench_full_scan(conn, queries, k, dim):
     print("    Full scan...")
-    results, latencies = run_queries(conn, queries, k)
+    results, latencies = run_queries(conn, queries, k, dim)
     return {
         "method": "full_scan",
         "build_time": 0.0,
@@ -134,20 +144,18 @@ def bench_full_scan(conn, queries, k):
         "median_latency": np.median(latencies),
         "p99_latency": np.percentile(latencies, 99),
         "throughput": len(queries) / sum(latencies),
-        "recall": 1.0,  # full scan is exact by definition
+        "recall": 1.0,
     }, results
 
 
-def bench_hnsw(conn, queries, ground_truth, k):
+def bench_hnsw(conn, queries, ground_truth, k, dim):
     print("    HNSW...")
     conn.execute("DROP INDEX IF EXISTS hnsw_idx")
     t0 = time.perf_counter()
-    conn.execute("CREATE INDEX hnsw_idx ON sift USING HNSW (embedding)")
+    conn.execute("CREATE INDEX hnsw_idx ON vectors USING HNSW (embedding)")
     build_time = time.perf_counter() - t0
-
-    results, latencies = run_queries(conn, queries, k)
+    results, latencies = run_queries(conn, queries, k, dim)
     recall = compute_recall(results, ground_truth, k)
-
     conn.execute("DROP INDEX IF EXISTS hnsw_idx")
     return {
         "method": "hnsw",
@@ -160,20 +168,18 @@ def bench_hnsw(conn, queries, ground_truth, k):
     }
 
 
-def bench_lsh(conn, queries, ground_truth, k, num_tables, num_bits):
+def bench_lsh(conn, queries, ground_truth, k, dim, num_tables, num_bits):
     label = f"lsh_t{num_tables}_b{num_bits}"
     print(f"    LSH (tables={num_tables}, bits={num_bits})...")
     conn.execute("DROP INDEX IF EXISTS lsh_idx")
     t0 = time.perf_counter()
     conn.execute(
-        f"CREATE INDEX lsh_idx ON sift USING LSH (embedding) "
+        f"CREATE INDEX lsh_idx ON vectors USING LSH (embedding) "
         f"WITH (lsh_tables={num_tables}, lsh_bits={num_bits})"
     )
     build_time = time.perf_counter() - t0
-
-    results, latencies = run_queries(conn, queries, k)
+    results, latencies = run_queries(conn, queries, k, dim)
     recall = compute_recall(results, ground_truth, k)
-
     conn.execute("DROP INDEX IF EXISTS lsh_idx")
     return {
         "method": label,
@@ -187,214 +193,150 @@ def bench_lsh(conn, queries, ground_truth, k, num_tables, num_bits):
         "lsh_bits": num_bits,
     }
 
-
 # ---------------------------------------------------------------------------
 # Plotting helpers
 # ---------------------------------------------------------------------------
 
-# Color map: lsh_tables value -> color
 _TABLE_COLORS = {2: "#1f77b4", 4: "#ff7f0e", 8: "#2ca02c", 16: "#d62728", 32: "#9467bd"}
-# Size map: lsh_bits value -> marker size
 _BITS_SIZES = {8: 30, 12: 55, 16: 80, 24: 110, 32: 145}
 
 
 def _get_lsh_style(r):
-    """Return (color, size) for an LSH result row."""
-    c = _TABLE_COLORS.get(r.get("lsh_tables"), "gray")
-    s = _BITS_SIZES.get(r.get("lsh_bits"), 60)
-    return c, s
+    return _TABLE_COLORS.get(r.get("lsh_tables"), "gray"), _BITS_SIZES.get(r.get("lsh_bits"), 60)
 
 
 def _pick_representative_lsh(all_rows):
-    """Pick 3 LSH configs: best recall, worst recall, and a middle one."""
     lsh = [r for r in all_rows if r["method"].startswith("lsh_")]
     if not lsh:
         return []
     by_recall = sorted(lsh, key=lambda r: r["recall"])
-    best = by_recall[-1]
-    worst = by_recall[0]
-    mid = by_recall[len(by_recall) // 2]
-    seen = set()
-    reps = []
+    best, worst, mid = by_recall[-1], by_recall[0], by_recall[len(by_recall) // 2]
+    seen, reps = set(), []
     for r in [best, mid, worst]:
         if r["method"] not in seen:
             seen.add(r["method"])
             reps.append(r)
     return reps
 
-
 # ---------------------------------------------------------------------------
-# Plot 1: Recall vs Latency (per dataset size)
+# Plot functions
 # ---------------------------------------------------------------------------
 
-def plot_recall_vs_latency(all_rows, n):
+def plot_recall_vs_latency(all_rows, n, plots_dir, dataset_label):
     fig, ax = plt.subplots(figsize=(9, 6))
     rows = [r for r in all_rows if r["n"] == n]
 
-    # --- Full scan ---
     fs = [r for r in rows if r["method"] == "full_scan"]
     if fs:
-        ax.scatter(
-            [r["mean_latency"] * 1000 for r in fs],
-            [r["recall"] for r in fs],
-            marker="s", s=160, color="black", label="Full Scan", zorder=10,
-            edgecolors="black", linewidths=1.5,
-        )
+        ax.scatter([r["mean_latency"] * 1000 for r in fs], [r["recall"] for r in fs],
+                   marker="s", s=160, color="black", label="Full Scan", zorder=10,
+                   edgecolors="black", linewidths=1.5)
 
-    # --- HNSW ---
     hnsw = [r for r in rows if r["method"] == "hnsw"]
     if hnsw:
-        ax.scatter(
-            [r["mean_latency"] * 1000 for r in hnsw],
-            [r["recall"] for r in hnsw],
-            marker="D", s=160, color="#e41a1c", label="HNSW", zorder=10,
-            edgecolors="black", linewidths=1.5,
-        )
+        ax.scatter([r["mean_latency"] * 1000 for r in hnsw], [r["recall"] for r in hnsw],
+                   marker="D", s=160, color="#e41a1c", label="HNSW", zorder=10,
+                   edgecolors="black", linewidths=1.5)
 
-    # --- LSH: color = tables, size = bits ---
     lsh = [r for r in rows if r["method"].startswith("lsh_")]
-    tables_seen = set()
-    bits_seen = set()
+    tables_seen, bits_seen = set(), set()
     for r in lsh:
         c, s = _get_lsh_style(r)
-        t_label = f"tables={r['lsh_tables']}"
-        ax.scatter(
-            r["mean_latency"] * 1000, r["recall"],
-            marker="o", s=s, color=c, alpha=0.85, zorder=5,
-            edgecolors="black", linewidths=0.5,
-            label=t_label if r["lsh_tables"] not in tables_seen else None,
-        )
+        ax.scatter(r["mean_latency"] * 1000, r["recall"], marker="o", s=s, color=c,
+                   alpha=0.85, zorder=5, edgecolors="black", linewidths=0.5,
+                   label=f"tables={r['lsh_tables']}" if r["lsh_tables"] not in tables_seen else None)
         tables_seen.add(r["lsh_tables"])
         bits_seen.add(r["lsh_bits"])
 
-    # Annotate best LSH point
     if lsh:
         best = max(lsh, key=lambda r: (r["recall"], -r["mean_latency"]))
-        ax.annotate(
-            f"  t={best['lsh_tables']}, b={best['lsh_bits']}",
-            (best["mean_latency"] * 1000, best["recall"]),
-            fontsize=8, fontweight="bold",
-        )
+        ax.annotate(f"  t={best['lsh_tables']}, b={best['lsh_bits']}",
+                    (best["mean_latency"] * 1000, best["recall"]), fontsize=8, fontweight="bold")
 
-    # Size legend for bits
-    if bits_seen:
-        for b in sorted(bits_seen):
-            ax.scatter([], [], marker="o", s=_BITS_SIZES.get(b, 60),
-                       color="gray", edgecolors="black", linewidths=0.5,
-                       label=f"bits={b}")
+    for b in sorted(bits_seen):
+        ax.scatter([], [], marker="o", s=_BITS_SIZES.get(b, 60), color="gray",
+                   edgecolors="black", linewidths=0.5, label=f"bits={b}")
 
     ax.set_xlabel("Mean Query Latency (ms)", fontsize=11)
     ax.set_ylabel(f"Recall@{K}", fontsize=11)
-    ax.set_title(f"Recall vs Query Latency  (N={n:,}, K={K})", fontsize=13)
+    ax.set_title(f"{dataset_label}: Recall vs Query Latency  (N={n:,}, K={K})", fontsize=13)
     ax.legend(loc="lower right", fontsize=8, ncol=2, framealpha=0.9)
     ax.grid(True, alpha=0.25)
     ax.set_ylim(-0.05, 1.08)
     fig.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, f"recall_vs_latency_n{n}.png"), dpi=150)
+    fig.savefig(os.path.join(plots_dir, f"recall_vs_latency_n{n}.png"), dpi=150)
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Plot 2: Build time vs dataset size
-# ---------------------------------------------------------------------------
-
-def plot_build_time(all_rows):
+def plot_build_time(all_rows, plots_dir, dataset_label):
     fig, ax = plt.subplots(figsize=(9, 6))
-
-    # HNSW
-    hnsw = sorted(
-        [r for r in all_rows if r["method"] == "hnsw"],
-        key=lambda r: r["n"],
-    )
+    hnsw = sorted([r for r in all_rows if r["method"] == "hnsw"], key=lambda r: r["n"])
     if hnsw:
         ax.plot([r["n"] for r in hnsw], [r["build_time"] for r in hnsw],
                 marker="D", color="#e41a1c", linewidth=2, markersize=8, label="HNSW")
 
-    # Representative LSH configs at each N
     sizes = sorted(set(r["n"] for r in all_rows))
     lsh_methods = set()
     for n in sizes:
-        reps = _pick_representative_lsh([r for r in all_rows if r["n"] == n])
-        for r in reps:
-            lsh_methods.add(r["method"])
-
-    for method in sorted(lsh_methods):
-        rows = sorted(
-            [r for r in all_rows if r["method"] == method],
-            key=lambda r: r["n"],
-        )
-        if rows:
-            t, b = rows[0].get("lsh_tables", "?"), rows[0].get("lsh_bits", "?")
-            c = _TABLE_COLORS.get(t, "gray")
-            ax.plot([r["n"] for r in rows], [r["build_time"] for r in rows],
-                    marker="o", color=c, linewidth=1.5, markersize=6,
-                    linestyle="--", label=f"LSH t={t} b={b}")
-
-    ax.set_xlabel("Dataset Size (N)", fontsize=11)
-    ax.set_ylabel("Index Build Time (s)", fontsize=11)
-    ax.set_title("Index Build Time vs Dataset Size", fontsize=13)
-    ax.legend(fontsize=9, framealpha=0.9)
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, "build_time.png"), dpi=150)
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Plot 3: Scalability — latency vs dataset size
-# ---------------------------------------------------------------------------
-
-def plot_scalability(all_rows):
-    fig, ax = plt.subplots(figsize=(9, 6))
-
-    # Full scan
-    fs = sorted([r for r in all_rows if r["method"] == "full_scan"], key=lambda r: r["n"])
-    if fs:
-        ax.plot([r["n"] for r in fs], [r["mean_latency"] * 1000 for r in fs],
-                marker="s", color="black", linewidth=2, markersize=8, label="Full Scan")
-
-    # HNSW
-    hnsw = sorted([r for r in all_rows if r["method"] == "hnsw"], key=lambda r: r["n"])
-    if hnsw:
-        ax.plot([r["n"] for r in hnsw], [r["mean_latency"] * 1000 for r in hnsw],
-                marker="D", color="#e41a1c", linewidth=2, markersize=8, label="HNSW")
-
-    # Representative LSH configs
-    sizes = sorted(set(r["n"] for r in all_rows))
-    lsh_methods = set()
-    for n in sizes:
-        reps = _pick_representative_lsh([r for r in all_rows if r["n"] == n])
-        for r in reps:
+        for r in _pick_representative_lsh([r for r in all_rows if r["n"] == n]):
             lsh_methods.add(r["method"])
 
     for method in sorted(lsh_methods):
         rows = sorted([r for r in all_rows if r["method"] == method], key=lambda r: r["n"])
         if rows:
             t, b = rows[0].get("lsh_tables", "?"), rows[0].get("lsh_bits", "?")
-            c = _TABLE_COLORS.get(t, "gray")
-            ax.plot([r["n"] for r in rows], [r["mean_latency"] * 1000 for r in rows],
-                    marker="o", color=c, linewidth=1.5, markersize=6,
-                    linestyle="--", label=f"LSH t={t} b={b}")
+            ax.plot([r["n"] for r in rows], [r["build_time"] for r in rows],
+                    marker="o", color=_TABLE_COLORS.get(t, "gray"), linewidth=1.5,
+                    markersize=6, linestyle="--", label=f"LSH t={t} b={b}")
 
     ax.set_xlabel("Dataset Size (N)", fontsize=11)
-    ax.set_ylabel("Mean Query Latency (ms)", fontsize=11)
-    ax.set_title(f"Query Latency vs Dataset Size  (K={K})", fontsize=13)
+    ax.set_ylabel("Index Build Time (s)", fontsize=11)
+    ax.set_title(f"{dataset_label}: Index Build Time vs Dataset Size", fontsize=13)
     ax.legend(fontsize=9, framealpha=0.9)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, "scalability.png"), dpi=150)
+    fig.savefig(os.path.join(plots_dir, "build_time.png"), dpi=150)
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Plot 4: LSH parameter sensitivity heatmaps
-# ---------------------------------------------------------------------------
+def plot_scalability(all_rows, plots_dir, dataset_label):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    fs = sorted([r for r in all_rows if r["method"] == "full_scan"], key=lambda r: r["n"])
+    if fs:
+        ax.plot([r["n"] for r in fs], [r["mean_latency"] * 1000 for r in fs],
+                marker="s", color="black", linewidth=2, markersize=8, label="Full Scan")
 
-def plot_lsh_param_sensitivity(all_rows, n):
-    lsh_rows = [
-        r for r in all_rows
-        if r["method"].startswith("lsh_") and r["n"] == n
-    ]
+    hnsw = sorted([r for r in all_rows if r["method"] == "hnsw"], key=lambda r: r["n"])
+    if hnsw:
+        ax.plot([r["n"] for r in hnsw], [r["mean_latency"] * 1000 for r in hnsw],
+                marker="D", color="#e41a1c", linewidth=2, markersize=8, label="HNSW")
+
+    sizes = sorted(set(r["n"] for r in all_rows))
+    lsh_methods = set()
+    for n in sizes:
+        for r in _pick_representative_lsh([r for r in all_rows if r["n"] == n]):
+            lsh_methods.add(r["method"])
+
+    for method in sorted(lsh_methods):
+        rows = sorted([r for r in all_rows if r["method"] == method], key=lambda r: r["n"])
+        if rows:
+            t, b = rows[0].get("lsh_tables", "?"), rows[0].get("lsh_bits", "?")
+            ax.plot([r["n"] for r in rows], [r["mean_latency"] * 1000 for r in rows],
+                    marker="o", color=_TABLE_COLORS.get(t, "gray"), linewidth=1.5,
+                    markersize=6, linestyle="--", label=f"LSH t={t} b={b}")
+
+    ax.set_xlabel("Dataset Size (N)", fontsize=11)
+    ax.set_ylabel("Mean Query Latency (ms)", fontsize=11)
+    ax.set_title(f"{dataset_label}: Query Latency vs Dataset Size  (K={K})", fontsize=13)
+    ax.legend(fontsize=9, framealpha=0.9)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(os.path.join(plots_dir, "scalability.png"), dpi=150)
+    plt.close(fig)
+
+
+def plot_lsh_param_sensitivity(all_rows, n, plots_dir, dataset_label):
+    lsh_rows = [r for r in all_rows if r["method"].startswith("lsh_") and r["n"] == n]
     if not lsh_rows:
         return
 
@@ -404,61 +346,39 @@ def plot_lsh_param_sensitivity(all_rows, n):
     recall_grid = np.full((len(tables_vals), len(bits_vals)), np.nan)
     latency_grid = np.full((len(tables_vals), len(bits_vals)), np.nan)
     for r in lsh_rows:
-        ti = tables_vals.index(r["lsh_tables"])
-        bi = bits_vals.index(r["lsh_bits"])
+        ti, bi = tables_vals.index(r["lsh_tables"]), bits_vals.index(r["lsh_bits"])
         recall_grid[ti, bi] = r["recall"]
         latency_grid[ti, bi] = r["mean_latency"] * 1000
 
-    # --- Recall heatmap ---
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(recall_grid, aspect="auto", origin="lower", cmap="RdYlGn",
-                   vmin=0, vmax=1)
-    ax.set_xticks(range(len(bits_vals)))
-    ax.set_xticklabels(bits_vals, fontsize=10)
-    ax.set_yticks(range(len(tables_vals)))
-    ax.set_yticklabels(tables_vals, fontsize=10)
-    ax.set_xlabel("lsh_bits (hash length)", fontsize=11)
-    ax.set_ylabel("lsh_tables (number of hash tables)", fontsize=11)
-    ax.set_title(f"LSH Recall@{K}  (N={n:,})", fontsize=13)
-    for i in range(len(tables_vals)):
-        for j in range(len(bits_vals)):
-            val = recall_grid[i, j]
-            if not np.isnan(val):
-                color = "white" if val < 0.5 else "black"
-                ax.text(j, i, f"{val:.2f}", ha="center", va="center",
-                        fontsize=10, fontweight="bold", color=color)
-    fig.colorbar(im, ax=ax, label=f"Recall@{K}", shrink=0.8)
-    fig.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, f"lsh_recall_heatmap_n{n}.png"), dpi=150)
-    plt.close(fig)
-
-    # --- Latency heatmap ---
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(latency_grid, aspect="auto", origin="lower", cmap="YlOrRd")
-    ax.set_xticks(range(len(bits_vals)))
-    ax.set_xticklabels(bits_vals, fontsize=10)
-    ax.set_yticks(range(len(tables_vals)))
-    ax.set_yticklabels(tables_vals, fontsize=10)
-    ax.set_xlabel("lsh_bits (hash length)", fontsize=11)
-    ax.set_ylabel("lsh_tables (number of hash tables)", fontsize=11)
-    ax.set_title(f"LSH Mean Query Latency (ms)  (N={n:,})", fontsize=13)
-    for i in range(len(tables_vals)):
-        for j in range(len(bits_vals)):
-            val = latency_grid[i, j]
-            if not np.isnan(val):
-                ax.text(j, i, f"{val:.1f}", ha="center", va="center",
-                        fontsize=10, fontweight="bold")
-    fig.colorbar(im, ax=ax, label="Latency (ms)", shrink=0.8)
-    fig.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, f"lsh_latency_heatmap_n{n}.png"), dpi=150)
-    plt.close(fig)
+    for grid, cmap, vlabel, fname, vmin, vmax in [
+        (recall_grid, "RdYlGn", f"Recall@{K}", f"lsh_recall_heatmap_n{n}.png", 0, 1),
+        (latency_grid, "YlOrRd", "Latency (ms)", f"lsh_latency_heatmap_n{n}.png", None, None),
+    ]:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        im = ax.imshow(grid, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_xticks(range(len(bits_vals)))
+        ax.set_xticklabels(bits_vals, fontsize=10)
+        ax.set_yticks(range(len(tables_vals)))
+        ax.set_yticklabels(tables_vals, fontsize=10)
+        ax.set_xlabel("lsh_bits (hash length)", fontsize=11)
+        ax.set_ylabel("lsh_tables (number of hash tables)", fontsize=11)
+        title_metric = "Recall" if "recall" in fname else "Mean Query Latency (ms)"
+        ax.set_title(f"{dataset_label}: LSH {title_metric}  (N={n:,})", fontsize=13)
+        for i in range(len(tables_vals)):
+            for j in range(len(bits_vals)):
+                val = grid[i, j]
+                if not np.isnan(val):
+                    fmt = f"{val:.2f}" if "recall" in fname else f"{val:.1f}"
+                    color = "white" if ("recall" in fname and val < 0.5) else "black"
+                    ax.text(j, i, fmt, ha="center", va="center", fontsize=10,
+                            fontweight="bold", color=color)
+        fig.colorbar(im, ax=ax, label=vlabel, shrink=0.8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, fname), dpi=150)
+        plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Plot 5: Throughput comparison
-# ---------------------------------------------------------------------------
-
-def plot_throughput(all_rows, n):
+def plot_throughput(all_rows, n, plots_dir, dataset_label):
     rows = [r for r in all_rows if r["n"] == n]
     if not rows:
         return
@@ -474,9 +394,8 @@ def plot_throughput(all_rows, n):
     if hnsw:
         entries.append(("HNSW", hnsw["throughput"], "#e41a1c"))
     if best_lsh:
-        t, b = best_lsh["lsh_tables"], best_lsh["lsh_bits"]
-        entries.append((f"LSH t={t} b={b}", best_lsh["throughput"], "#2ca02c"))
-
+        entries.append((f"LSH t={best_lsh['lsh_tables']} b={best_lsh['lsh_bits']}",
+                        best_lsh["throughput"], "#2ca02c"))
     if not entries:
         return
 
@@ -489,18 +408,14 @@ def plot_throughput(all_rows, n):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                 f"{val:.0f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
     ax.set_ylabel("Throughput (queries/sec)", fontsize=11)
-    ax.set_title(f"Query Throughput  (N={n:,}, K={K})", fontsize=13)
+    ax.set_title(f"{dataset_label}: Query Throughput  (N={n:,}, K={K})", fontsize=13)
     ax.grid(True, axis="y", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, f"throughput_n{n}.png"), dpi=150)
+    fig.savefig(os.path.join(plots_dir, f"throughput_n{n}.png"), dpi=150)
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Plot 6: Summary comparison bar chart (largest N)
-# ---------------------------------------------------------------------------
-
-def plot_summary(all_rows):
+def plot_summary(all_rows, plots_dir, dataset_label):
     max_n = max(r["n"] for r in all_rows)
     rows = [r for r in all_rows if r["n"] == max_n]
 
@@ -516,17 +431,16 @@ def plot_summary(all_rows):
     if hnsw:
         methods.append(("HNSW", hnsw, "#e41a1c"))
     if best_lsh:
-        t, b = best_lsh["lsh_tables"], best_lsh["lsh_bits"]
-        methods.append((f"LSH best\nt={t} b={b}", best_lsh, "#2ca02c"))
+        methods.append((f"LSH best\nt={best_lsh['lsh_tables']} b={best_lsh['lsh_bits']}",
+                        best_lsh, "#2ca02c"))
     if worst_lsh and worst_lsh["method"] != (best_lsh or {}).get("method"):
-        t, b = worst_lsh["lsh_tables"], worst_lsh["lsh_bits"]
-        methods.append((f"LSH worst\nt={t} b={b}", worst_lsh, "#ff7f0e"))
-
+        methods.append((f"LSH worst\nt={worst_lsh['lsh_tables']} b={worst_lsh['lsh_bits']}",
+                        worst_lsh, "#ff7f0e"))
     if len(methods) < 2:
         return
 
     metrics = [
-        ("Recall@{}".format(K), "recall", "{:.2f}"),
+        (f"Recall@{K}", "recall", "{:.2f}"),
         ("Mean Latency (ms)", "mean_latency", "{:.1f}"),
         ("Build Time (s)", "build_time", "{:.2f}"),
     ]
@@ -547,33 +461,44 @@ def plot_summary(all_rows):
         ax.grid(True, axis="y", alpha=0.25)
         ax.tick_params(axis="x", labelsize=8)
 
-    fig.suptitle(f"Summary Comparison  (N={max_n:,}, K={K})", fontsize=14, y=1.02)
+    fig.suptitle(f"{dataset_label}: Summary  (N={max_n:,}, K={K})", fontsize=14, y=1.02)
     fig.tight_layout()
-    fig.savefig(os.path.join(PLOTS_DIR, "summary.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(os.path.join(plots_dir, "summary.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
-
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    print("Loading SIFT data...")
-    base_vectors = read_fvecs(os.path.join(DATA_DIR, "sift_base.fvecs"))
-    query_vectors = read_fvecs(os.path.join(DATA_DIR, "sift_query.fvecs"))
-    ground_truth = read_ivecs(os.path.join(DATA_DIR, "sift_groundtruth.ivecs"))
+    parser = argparse.ArgumentParser(description="Benchmark Full Scan vs HNSW vs LSH")
+    parser.add_argument("--dataset", required=True, choices=DATASET_CONFIG.keys(),
+                        help="Dataset to benchmark (sift or glove)")
+    args = parser.parse_args()
 
-    print(f"  Base: {base_vectors.shape}, Queries: {query_vectors.shape}, GT: {ground_truth.shape}")
+    cfg = DATASET_CONFIG[args.dataset]
+    results_dir = os.path.join(SCRIPT_DIR, args.dataset, "results")
+    plots_dir = os.path.join(SCRIPT_DIR, args.dataset, "plots")
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
+
+    print(f"Loading {cfg['label']} data...")
+    base_vectors = read_fvecs(os.path.join(cfg["data_dir"], cfg["base"]))
+    query_vectors = read_fvecs(os.path.join(cfg["data_dir"], cfg["query"]))
+    ground_truth = read_ivecs(os.path.join(cfg["data_dir"], cfg["groundtruth"]))
+
+    dim = base_vectors.shape[1]
+    print(f"  Base: {base_vectors.shape}, Queries: {query_vectors.shape}, "
+          f"GT: {ground_truth.shape}, dim={dim}")
 
     queries = query_vectors[:NUM_QUERIES]
-
     all_rows = []
     csv_fields = [
         "n", "method", "build_time", "mean_latency", "median_latency",
         "p99_latency", "throughput", "recall", "lsh_tables", "lsh_bits",
     ]
 
-    for n in DATASET_SIZES:
+    for n in cfg["sizes"]:
         if n > base_vectors.shape[0]:
             print(f"Skipping N={n}, only {base_vectors.shape[0]} base vectors available")
             continue
@@ -584,36 +509,34 @@ def main():
 
         conn = get_connection()
         print("  Loading table...")
-        load_table(conn, base_vectors, n)
+        load_table(conn, base_vectors, n, dim)
 
-        # Full scan (exact baseline — results used as ground truth)
-        row, exact_results = bench_full_scan(conn, queries, K)
+        row, exact_results = bench_full_scan(conn, queries, K, dim)
         row["n"] = n
         row.setdefault("lsh_tables", "")
         row.setdefault("lsh_bits", "")
         all_rows.append(row)
         print(f"    recall={row['recall']:.4f}  latency={row['mean_latency']*1000:.1f}ms")
 
-        # HNSW
-        row = bench_hnsw(conn, queries, exact_results, K)
+        row = bench_hnsw(conn, queries, exact_results, K, dim)
         row["n"] = n
         row.setdefault("lsh_tables", "")
         row.setdefault("lsh_bits", "")
         all_rows.append(row)
-        print(f"    recall={row['recall']:.4f}  latency={row['mean_latency']*1000:.1f}ms  build={row['build_time']:.2f}s")
+        print(f"    recall={row['recall']:.4f}  latency={row['mean_latency']*1000:.1f}ms  "
+              f"build={row['build_time']:.2f}s")
 
-        # LSH parameter grid
         for num_tables in LSH_TABLES_GRID:
             for num_bits in LSH_BITS_GRID:
-                row = bench_lsh(conn, queries, exact_results, K, num_tables, num_bits)
+                row = bench_lsh(conn, queries, exact_results, K, dim, num_tables, num_bits)
                 row["n"] = n
                 all_rows.append(row)
-                print(f"    recall={row['recall']:.4f}  latency={row['mean_latency']*1000:.1f}ms  build={row['build_time']:.2f}s")
+                print(f"    recall={row['recall']:.4f}  latency={row['mean_latency']*1000:.1f}ms  "
+                      f"build={row['build_time']:.2f}s")
 
         conn.close()
 
-    # Save results
-    csv_path = os.path.join(RESULTS_DIR, "benchmark_results.csv")
+    csv_path = os.path.join(results_dir, "benchmark_results.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields)
         writer.writeheader()
@@ -621,17 +544,16 @@ def main():
             writer.writerow({k: row.get(k, "") for k in csv_fields})
     print(f"\nResults saved to {csv_path}")
 
-    # Generate plots
     print("Generating plots...")
-    for n in DATASET_SIZES:
+    for n in cfg["sizes"]:
         if any(r["n"] == n for r in all_rows):
-            plot_recall_vs_latency(all_rows, n)
-            plot_lsh_param_sensitivity(all_rows, n)
-            plot_throughput(all_rows, n)
-    plot_build_time(all_rows)
-    plot_scalability(all_rows)
-    plot_summary(all_rows)
-    print(f"Plots saved to {PLOTS_DIR}")
+            plot_recall_vs_latency(all_rows, n, plots_dir, cfg["label"])
+            plot_lsh_param_sensitivity(all_rows, n, plots_dir, cfg["label"])
+            plot_throughput(all_rows, n, plots_dir, cfg["label"])
+    plot_build_time(all_rows, plots_dir, cfg["label"])
+    plot_scalability(all_rows, plots_dir, cfg["label"])
+    plot_summary(all_rows, plots_dir, cfg["label"])
+    print(f"Plots saved to {plots_dir}")
 
 
 if __name__ == "__main__":
